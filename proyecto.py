@@ -82,9 +82,10 @@ def init_db():
             ("Juan",   "Pérez",     "5to"),
             ("María",  "García",    "6to"),
             ("Carlos", "Rodríguez", "5to"),
+            ("Dennis", "Benitez"  , "DS3A"),
         ]
         c.executemany(
-            "INSERT INTO estudiantes (nombre, apellido, grado) VALUES (?,?,?)",
+            "INSERT INTO estudiantes (nombre, apellido, grado) VALUES (?,?,?,?)",
             estudiantes
         )
 
@@ -95,7 +96,7 @@ def init_db():
             ("admin",    "admin", "admin"),
         ]
         c.executemany(
-            "INSERT INTO usuarios (usuario, password, rol) VALUES (?,?,?)",
+            "INSERT INTO usuarios (usuario, password, rol) VALUES (?,?,?,?)",
             usuarios
         )
 
