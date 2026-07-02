@@ -4,14 +4,18 @@ import sqlite3
 from datetime import datetime
 import pickle
 import threading
+import time
+import cv2
+import face_recognition
+import numpy as np
 from PIL import Image, ImageTk
 
 WIN_MAIN   = "1400x900"
 WIN_PANEL  = "1400x900"
 WIN_INNER  = "1400x900"
 WIN_FORM   = "540x640"
-WIN_CAMARA = "900x700"
-WIN_CAPTU  = "680x520"
+WIN_CAMARA = "900x900"
+WIN_CAPTU  = "780x620"
 WIN_EXITO  = "680x440"
 WIN_LOGIN  = "480x340"
 WIN_DET    = "860x500"
@@ -33,7 +37,14 @@ FONT_NORMAL = ("Segoe UI", 12)
 FONT_SMALL  = ("Segoe UI", 11)
 FONT_BTN    = ("Segoe UI", 12, "bold")
 
-DB_FILE = "rae.db"
+DB_FILE = "proyecto20.db"
+
+# Segundos que debe pasar antes de volver a registrar al MISMO estudiante
+# automáticamente (evita registros duplicados por estar parado frente a la cámara)
+COOLDOWN_SEGUNDOS = 12
+# Cuántos frames "positivos" seguidos se necesitan para confirmar y registrar
+FRAMES_CONFIRMACION_AUTO = 8
+
 
 def get_connection():
     return sqlite3.connect(DB_FILE)
@@ -46,7 +57,7 @@ def init_db():
             id       INTEGER PRIMARY KEY AUTOINCREMENT,
             nombre   TEXT NOT NULL,
             apellido TEXT NOT NULL,
-            grado    TEXT NOT NULL,
+            Codigo   TEXT NOT NULL,
             password TEXT NOT NULL DEFAULT '1234'
         )
     """)
@@ -87,7 +98,7 @@ def init_db():
     c.execute("SELECT COUNT(*) FROM estudiantes")
     if c.fetchone()[0] == 0:
         c.executemany(
-            "INSERT INTO estudiantes (nombre, apellido, grado, password) VALUES (?,?,?,?)",
+            "INSERT INTO estudiantes (nombre, apellido, Codigo, password) VALUES (?,?,?,?)",
             [("Juan","Pérez","5to","1234"),("María","García","6to","1234"),("Carlos","Rodríguez","5to","1234")]
         )
     c.execute("SELECT COUNT(*) FROM usuarios")
@@ -305,7 +316,8 @@ class BaseWindow(tk.Toplevel):
 
 
 # ═══════════════════════════════════════════════════════════════
-#  CAPTURA DE ROSTRO
+#  CAPTURA DE ROSTRO (sigue siendo una ventana aparte — se usa
+#  solo al dar de alta/editar estudiantes, no en el registro diario)
 # ═══════════════════════════════════════════════════════════════
 class CapturaRostro(BaseWindow):
     def __init__(self, master, callback):
@@ -427,7 +439,7 @@ class FormEstudiante(BaseWindow):
 
         self.e_nombre   = campo("Nombre",    0)
         self.e_apellido = campo("Apellido",  1)
-        self.e_grado    = campo("Grado",     2)
+        self.e_Codigo    = campo("Codigo",     2)
         self.e_password = campo("Contraseña",3, show="*")
 
         self.btn_capturar = tk.Button(
@@ -445,7 +457,7 @@ class FormEstudiante(BaseWindow):
         if self.est_id:
             conn = get_connection()
             c = conn.cursor()
-            c.execute("SELECT nombre, apellido, grado, password FROM estudiantes WHERE id=?", (self.est_id,))
+            c.execute("SELECT nombre, apellido, Codigo, password FROM estudiantes WHERE id=?", (self.est_id,))
             row = c.fetchone()
             c.execute("SELECT COUNT(*) FROM estudiantes_faces WHERE estudiante_id=?", (self.est_id,))
             tiene_rostro = c.fetchone()[0] > 0
@@ -453,7 +465,7 @@ class FormEstudiante(BaseWindow):
             if row:
                 self.e_nombre.insert(0, row[0])
                 self.e_apellido.insert(0, row[1])
-                self.e_grado.insert(0, row[2])
+                self.e_Codigo.insert(0, row[2])
                 self.e_password.insert(0, row[3])
             if tiene_rostro:
                 self.lbl_rostro.config(text="✅ Rostro ya registrado en BD", fg=COLOR_GREEN)
@@ -479,9 +491,9 @@ class FormEstudiante(BaseWindow):
     def _guardar(self):
         nombre   = self.e_nombre.get().strip()
         apellido = self.e_apellido.get().strip()
-        grado    = self.e_grado.get().strip()
+        Codigo    = self.e_Codigo.get().strip()
         password = self.e_password.get().strip()
-        if not nombre or not apellido or not grado or not password:
+        if not nombre or not apellido or not Codigo or not password:
             messagebox.showwarning("Campos vacíos", "Complete todos los campos.")
             return
         conn = get_connection()
@@ -489,14 +501,14 @@ class FormEstudiante(BaseWindow):
         try:
             if self.est_id:
                 c.execute(
-                    "UPDATE estudiantes SET nombre=?, apellido=?, grado=?, password=? WHERE id=?",
-                    (nombre, apellido, grado, password, self.est_id)
+                    "UPDATE estudiantes SET nombre=?, apellido=?, Codigo=?, password=? WHERE id=?",
+                    (nombre, apellido, Codigo, password, self.est_id)
                 )
                 id_guardado = self.est_id
             else:
                 c.execute(
-                    "INSERT INTO estudiantes (nombre, apellido, grado, password) VALUES (?,?,?,?)",
-                    (nombre, apellido, grado, password)
+                    "INSERT INTO estudiantes (nombre, apellido, Codigo, password) VALUES (?,?,?,?)",
+                    (nombre, apellido, Codigo, password)
                 )
                 id_guardado = c.lastrowid
                 self.est_id = id_guardado
@@ -525,48 +537,44 @@ class FormEstudiante(BaseWindow):
 
 
 # ═══════════════════════════════════════════════════════════════
-#  VENTANA RECONOCIMIENTO FACIAL
+#  MOTOR DE RECONOCIMIENTO EN VIVO (reutilizable)
+#  Encapsula: apertura de cámara, hilo de video, comparación de
+#  rostros y lógica de auto-registro con cooldown.
+#  Se usa embebido dentro de PantallaInicio.
 # ═══════════════════════════════════════════════════════════════
-class VentanaCamaraReconocimiento(BaseWindow):
-    FRAMES_CONFIRMACION = 8
+class MotorReconocimientoVivo:
+    """
+    Maneja la cámara y el reconocimiento facial continuo.
+    - on_frame(imgtk): callback para mostrar cada frame (llamado en el hilo de Tk vía after)
+    - on_estado(texto, color): callback para actualizar la etiqueta de estado
+    - on_reconocido(est_id, nombre, apellido): callback cuando se CONFIRMA y se debe registrar
+    """
 
-    def __init__(self, master, callback_registro):
-        super().__init__(master, "Reconocimiento Facial", WIN_CAMARA)
-        self.callback_registro = callback_registro
-        self.capturando        = True
-        self.rostro_reconocido = None
-        self.imgtk_ref         = None
-        self._frames_confirm   = 0
-        self._registrando      = False
-        self._build()
+    def __init__(self, on_frame, on_estado, on_reconocido,
+                 frames_confirmacion=FRAMES_CONFIRMACION_AUTO,
+                 cooldown=COOLDOWN_SEGUNDOS):
+        self.on_frame       = on_frame
+        self.on_estado       = on_estado
+        self.on_reconocido  = on_reconocido
+        self.frames_confirmacion = frames_confirmacion
+        self.cooldown       = cooldown
 
-    def _build(self):
-        make_header(self, "RAE – Identificación por Cámara")
-        self.lbl_video = tk.Label(self, bg="black")
-        self.lbl_video.pack(padx=12, pady=(12,6))
-        self.lbl_info = tk.Label(self, text="🔍 Buscando rostro...",
-                                 bg=BG_MAIN, font=FONT_HEADER, fg=COLOR_GRAY)
-        self.lbl_info.pack(pady=4)
-        prog_frame = tk.Frame(self, bg=BG_MAIN)
-        prog_frame.pack(pady=6)
-        tk.Label(prog_frame, text="Confirmando:", bg=BG_MAIN, font=FONT_SMALL,
-                 fg=COLOR_GRAY).pack(side="left", padx=(0,8))
-        self.progress = ttk.Progressbar(prog_frame, length=320, maximum=self.FRAMES_CONFIRMACION,
-                                        mode="determinate")
-        self.progress.pack(side="left")
-        make_btn(self, "✔ Confirmar manualmente", self._confirmar_manual,
-                 color=COLOR_GRAY, width=26).pack(pady=8)
-        tk.Label(self, text="El sistema registrará automáticamente al reconocer el rostro.",
-                 bg=BG_MAIN, font=FONT_SMALL, fg=COLOR_GRAY).pack()
-        self.known_encodings, self.known_ids, self.known_names = self._cargar_codificaciones()
-        self.cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
-        if not self.cap.isOpened():
-            raise Exception("No se pudo abrir la cámara.")
-        self.thread = threading.Thread(target=self._loop_video, daemon=True)
-        self.thread.start()
-        self.protocol("WM_DELETE_WINDOW", self._cerrar)
+        self.cap = None
+        self.activo = False
+        self.thread = None
 
-    def _cargar_codificaciones(self):
+        self.known_encodings = []
+        self.known_ids = []
+        self.known_names = []
+
+        self._frames_confirm = 0
+        self._ultimo_reconocido_id = None
+
+        # Cooldown por estudiante: {est_id: timestamp_ultimo_registro}
+        self._cooldowns = {}
+        self._lock = threading.Lock()
+
+    def cargar_codificaciones(self):
         encodings, ids, names = [], [], []
         conn = get_connection()
         c = conn.cursor()
@@ -581,116 +589,162 @@ class VentanaCamaraReconocimiento(BaseWindow):
                 encodings.append(enc)
                 ids.append(est_id)
                 names.append(nombre)
-            except:
+            except Exception:
                 pass
         conn.close()
-        return encodings, ids, names
+        with self._lock:
+            self.known_encodings = encodings
+            self.known_ids = ids
+            self.known_names = names
 
-    def _loop_video(self):
+    def iniciar(self):
+        if self.activo:
+            return True
+        self.cargar_codificaciones()
+        self.cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+        if not self.cap.isOpened():
+            self.cap = None
+            return False
+        self.activo = True
+        self.thread = threading.Thread(target=self._loop, daemon=True)
+        self.thread.start()
+        return True
+
+    def detener(self):
+        self.activo = False
+        if self.cap is not None:
+            try:
+                if self.cap.isOpened():
+                    self.cap.release()
+            except Exception:
+                pass
+            self.cap = None
+
+    def _en_cooldown(self, est_id):
+        ts = self._cooldowns.get(est_id)
+        if ts is None:
+            return False
+        return (time.time() - ts) < self.cooldown
+
+    def _marcar_cooldown(self, est_id):
+        self._cooldowns[est_id] = time.time()
+
+    def _loop(self):
         scale = 0.25
-        face_locs = []
-        nombre_disp = "Desconocido"
-        color = (0, 0, 255)
         frame_count = 0
-        while self.capturando:
+        face_locs_disp = []
+        nombre_disp = "Desconocido"
+        color_disp = (0, 0, 255)
+
+        while self.activo:
+            if self.cap is None:
+                break
             ret, frame = self.cap.read()
             if not ret:
                 break
             frame = cv2.flip(frame, 1)
+
             if frame_count % 3 == 0:
-                small     = cv2.resize(frame, (0,0), fx=scale, fy=scale)
+                small     = cv2.resize(frame, (0, 0), fx=scale, fy=scale)
                 rgb_small = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
-                locs      = face_recognition.face_locations(rgb_small, number_of_times_to_upsample=0)
-                encs      = face_recognition.face_encodings(rgb_small, locs, num_jitters=0)
-                self.rostro_reconocido = None
+                locs = face_recognition.face_locations(rgb_small, number_of_times_to_upsample=0)
+                encs = face_recognition.face_encodings(rgb_small, locs, num_jitters=0)
+
+                reconocido = None
                 nombre_disp = "Desconocido"
-                color = (0, 0, 255)
+                color_disp = (0, 0, 255)
+                estado_texto = "🔍 Buscando rostro..."
+                estado_color = COLOR_GRAY
+
+                with self._lock:
+                    known_encodings = list(self.known_encodings)
+                    known_ids = list(self.known_ids)
+                    known_names = list(self.known_names)
+
                 for enc in encs:
-                    if self.known_encodings:
-                        matches = face_recognition.compare_faces(self.known_encodings, enc, tolerance=0.5)
+                    if known_encodings:
+                        matches = face_recognition.compare_faces(known_encodings, enc, tolerance=0.5)
                         if True in matches:
                             idx = matches.index(True)
-                            nombre_disp = self.known_names[idx]
-                            self.rostro_reconocido = (self.known_ids[idx], self.known_names[idx])
-                            color = (0, 255, 0)
+                            nombre_disp = known_names[idx]
+                            reconocido = (known_ids[idx], known_names[idx])
+                            color_disp = (0, 255, 0)
                             break
-                face_locs = []
+
+                face_locs_disp = []
                 for (top, right, bottom, left) in locs:
-                    face_locs.append((int(top/scale), int(right/scale), int(bottom/scale), int(left/scale)))
-                if self.rostro_reconocido:
-                    self._frames_confirm = min(self._frames_confirm + 1, self.FRAMES_CONFIRMACION)
+                    face_locs_disp.append((
+                        int(top / scale), int(right / scale),
+                        int(bottom / scale), int(left / scale)
+                    ))
+
+                if reconocido:
+                    est_id = reconocido[0]
+                    if est_id == self._ultimo_reconocido_id:
+                        self._frames_confirm = min(self._frames_confirm + 1, self.frames_confirmacion)
+                    else:
+                        self._ultimo_reconocido_id = est_id
+                        self._frames_confirm = 1
+
+                    if self._en_cooldown(est_id):
+                        restante = int(self.cooldown - (time.time() - self._cooldowns[est_id]))
+                        estado_texto = f"✅ {nombre_disp}  —  ya registrado (espera {max(restante,0)}s)"
+                        estado_color = COLOR_BLUE
+                    else:
+                        estado_texto = f"✅ Reconocido: {nombre_disp}"
+                        estado_color = COLOR_GREEN
+                        if self._frames_confirm >= self.frames_confirmacion:
+                            self._marcar_cooldown(est_id)
+                            self._frames_confirm = 0
+                            partes = nombre_disp.split(" ", 1)
+                            nom = partes[0]
+                            ape = partes[1] if len(partes) > 1 else ""
+                            if self.on_reconocido:
+                                # Ejecutar callback fuera del hilo de captura
+                                self._safe_after(self.on_reconocido, est_id, nom, ape)
                 else:
+                    self._ultimo_reconocido_id = None
                     self._frames_confirm = 0
-                if self._frames_confirm >= self.FRAMES_CONFIRMACION and not self._registrando:
-                    self._registrando = True
-                    self.after(0, self._auto_registrar)
-            for (top, right, bottom, left) in face_locs:
-                cv2.rectangle(frame, (left,top), (right,bottom), color, 2)
-                cv2.putText(frame, nombre_disp, (left, top-10),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
-            img   = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+
+                if self.on_estado:
+                    self._safe_after(self.on_estado, estado_texto, estado_color)
+
+            # Dibujar rectángulos sobre el frame
+            for (top, right, bottom, left) in face_locs_disp:
+                cv2.rectangle(frame, (left, top), (right, bottom), color_disp, 2)
+                cv2.putText(frame, nombre_disp, (left, top - 10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, color_disp, 2)
+
+            img = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
             imgtk = ImageTk.PhotoImage(image=img)
-            try:
-                self.lbl_video.after(0, self._update_video, imgtk)
-                n = self._frames_confirm
-                if self.rostro_reconocido:
-                    self.lbl_info.after(0, lambda nm=nombre_disp: self.lbl_info.config(
-                        text=f"✅ Reconocido: {nm}", fg=COLOR_GREEN))
-                else:
-                    self.lbl_info.after(0, lambda: self.lbl_info.config(
-                        text="🔍 Buscando rostro...", fg=COLOR_GRAY))
-                self.progress.after(0, lambda v=n: self.progress.config(value=v))
-            except tk.TclError:
-                break
+            if self.on_frame:
+                self._safe_after(self.on_frame, imgtk)
+
             frame_count += 1
 
-    def _update_video(self, imgtk):
-        self.imgtk_ref = imgtk
-        self.lbl_video.configure(image=imgtk)
-
-    def _auto_registrar(self):
-        if not self.rostro_reconocido:
-            self._registrando = False
-            return
-        est_id, nombre = self.rostro_reconocido
-        partes = nombre.split(" ", 1)
-        nom = partes[0]
-        ape = partes[1] if len(partes) > 1 else ""
-        self._cerrar()
-        realizar_registro_db(est_id, nom, ape, master=self.master)
-        self.callback_registro(est_id, nom, ape)
-
-    def _confirmar_manual(self):
-        if self.rostro_reconocido:
-            est_id, nombre = self.rostro_reconocido
-            partes = nombre.split(" ", 1)
-            nom = partes[0]
-            ape = partes[1] if len(partes) > 1 else ""
-            self._cerrar()
-            realizar_registro_db(est_id, nom, ape, master=self.master)
-            self.callback_registro(est_id, nom, ape)
-        else:
-            messagebox.showwarning("Sin reconocimiento",
-                                   "Acérquese a la cámara o no se ha reconocido ningún rostro.")
-
-    def _cerrar(self):
-        self.capturando = False
-        if hasattr(self, 'cap') and self.cap.isOpened():
-            self.cap.release()
+    def _safe_after(self, func, *args):
+        """Llama func(*args) de forma segura en el hilo principal de Tk."""
         try:
-            self.destroy()
+            func(*args)
         except tk.TclError:
+            pass
+        except RuntimeError:
             pass
 
 
 # ═══════════════════════════════════════════════════════════════
-#  PANTALLA INICIO
+#  PANTALLA INICIO — ahora con cámara SIEMPRE ACTIVA y registro
+#  100% automático (sin botones que apretar).
 # ═══════════════════════════════════════════════════════════════
 class PantallaInicio(tk.Frame):
     def __init__(self, master):
         super().__init__(master, bg=BG_MAIN)
         self.pack(fill="both", expand=True)
+        self.motor = None
+        self.imgtk_ref = None
         self._build()
+        self._iniciar_camara_automatica()
+        self.bind("<Destroy>", self._on_destroy)
 
     def _build(self):
         hdr = tk.Frame(self, bg=BG_HEADER)
@@ -699,22 +753,35 @@ class PantallaInicio(tk.Frame):
                  bg=BG_HEADER, font=("Segoe UI",13,"bold"), padx=20).pack(side="left", pady=14)
 
         tk.Label(self, text="Registro de Ingreso / Salida",
-                 bg=BG_MAIN, font=FONT_TITLE).pack(pady=(50,24))
+                 bg=BG_MAIN, font=FONT_TITLE).pack(pady=(20,14))
 
-        card = tk.Frame(self, bg=BG_CARD, bd=1, relief="solid", padx=50, pady=38)
-        card.pack(ipadx=20)
-        tk.Label(card, text="Ingresar Datos Manualmente", bg=BG_CARD, font=FONT_HEADER).pack(pady=(0,16))
+        # ── Tarjeta de cámara SIEMPRE VISIBLE Y ACTIVA ──
+        cam_card = tk.Frame(self, bg=BG_CARD, bd=1, relief="solid", padx=20, pady=16)
+        cam_card.pack()
 
-        self.entry_id = tk.Entry(card, font=FONT_NORMAL, width=36, bd=1, relief="solid")
-        self.entry_id.pack(pady=(0,18), ipady=10)
-        self.entry_id.bind("<Return>", lambda e: self._registrar())
+        self.lbl_video = tk.Label(cam_card, bg="black", width=640, height=360)
+        self.lbl_video.pack()
 
-        make_btn(card, "Registrar", self._registrar, width=34).pack()
-        make_btn(card, "🔍 Identificación por cámara", self._abrir_camara,
-                 color=COLOR_GREEN, width=34).pack(pady=12)
+        self.lbl_estado_cam = tk.Label(
+            cam_card, text="Iniciando cámara...",
+            bg=BG_CARD, font=FONT_HEADER, fg=COLOR_GRAY
+        )
+        self.lbl_estado_cam.pack(pady=(10, 2))
+
+        tk.Label(cam_card, text="Identificación por cámara activa y en curso",
+                 bg=BG_CARD, font=FONT_SMALL, fg=COLOR_GREEN).pack()
+
+        # ── Alternativa manual (por si la cámara falla o el ID no tiene rostro) ──
+        manual = tk.Frame(self, bg=BG_MAIN)
+        manual.pack(pady=18)
+        tk.Label(manual, text="Ingrese ID manual:", bg=BG_MAIN, font=FONT_NORMAL).pack(side="left", padx=(0,8))
+        self.entry_id = tk.Entry(manual, font=FONT_NORMAL, width=18, bd=1, relief="solid")
+        self.entry_id.pack(side="left", ipady=6)
+        self.entry_id.bind("<Return>", lambda e: self._registrar_manual())
+        make_btn(manual, "Identificar", self._registrar_manual, width=14).pack(side="left", padx=8)
 
         icons_frame = tk.Frame(self, bg=BG_MAIN)
-        icons_frame.pack(pady=50)
+        icons_frame.pack(pady=(10, 20))
         self._make_icon(icons_frame, "👤","Acceso personal\nportería", COLOR_BLUE, self._login_porteria)
         self._make_icon(icons_frame, "👥","Acceso\nadministrador/director", "#2e7d32", self._login_admin)
 
@@ -725,7 +792,54 @@ class PantallaInicio(tk.Frame):
                   width=3, height=1, relief="flat", cursor="hand2", command=command).pack()
         tk.Label(frame, text=label, bg=BG_MAIN, font=FONT_SMALL, fg=COLOR_GRAY, justify="center").pack(pady=6)
 
-    def _registrar(self):
+    # ── Cámara automática ──────────────────────────────────────
+    def _iniciar_camara_automatica(self):
+        self.motor = MotorReconocimientoVivo(
+            on_frame=self._on_frame,
+            on_estado=self._on_estado,
+            on_reconocido=self._on_reconocido_auto,
+        )
+        ok = self.motor.iniciar()
+        if not ok:
+            self.lbl_estado_cam.config(
+                text="⚠ No se pudo abrir la cámara. Use el ID manual o contacte a soporte.",
+                fg=COLOR_RED
+            )
+
+    def _on_frame(self, imgtk):
+        self.imgtk_ref = imgtk
+        try:
+            self.lbl_video.configure(image=imgtk)
+        except tk.TclError:
+            pass
+
+    def _on_estado(self, texto, color):
+        try:
+            self.lbl_estado_cam.config(text=texto, fg=color)
+        except tk.TclError:
+            pass
+
+    def _on_reconocido_auto(self, est_id, nombre, apellido):
+        # Se llama automáticamente cuando el motor confirma un rostro
+        # (ya respetando su propio cooldown interno).
+        realizar_registro_db(est_id, nombre, apellido, master=self)
+
+    def _on_destroy(self, event=None):
+        if self.motor:
+            self.motor.detener()
+
+    def pausar_camara(self):
+        if self.motor:
+            self.motor.detener()
+
+    def reanudar_camara(self):
+        if self.motor and not self.motor.activo:
+            self.motor.iniciar()
+        elif self.motor is None:
+            self._iniciar_camara_automatica()
+
+    # ── Registro manual por ID (respaldo) ──────────────────────
+    def _registrar_manual(self):
         num_id = self.entry_id.get().strip()
         if not num_id:
             messagebox.showwarning("Campo requerido", "Ingrese un número de identificación.")
@@ -739,96 +853,28 @@ class PantallaInicio(tk.Frame):
             messagebox.showerror("No encontrado", f"No se encontró el estudiante con ID {num_id}.")
             return
         self.entry_id.delete(0, "end")
-        self._realizar_registro(row[0], row[1], row[2])
-
-    def _realizar_registro(self, est_id, nombre, apellido):
-        tipo, nom, ape = realizar_registro_db(est_id, nombre, apellido, master=self)
-        PantallaRegistroExitoso(self.winfo_toplevel(), nom, ape, tipo)
-
-    def _abrir_camara(self):
-        try:
-            VentanaCamaraReconocimiento(self.winfo_toplevel(), self._after_camara)
-        except Exception as e:
-            messagebox.showerror("Error de cámara", f"No se pudo iniciar la cámara: {e}")
-
-    def _after_camara(self, est_id, nombre, apellido):
-        conn = get_connection()
-        c = conn.cursor()
-        fecha = datetime.now().strftime("%Y-%m-%d")
-        c.execute(
-            "SELECT tipo FROM registros WHERE estudiante_id=? AND fecha=? ORDER BY id DESC LIMIT 1",
-            (est_id, fecha)
-        )
-        row  = c.fetchone()
-        conn.close()
-        tipo = row[0] if row else "Ingreso"
-        PantallaRegistroExitoso(self.winfo_toplevel(), nombre, apellido, tipo)
+        realizar_registro_db(row[0], row[1], row[2], master=self)
 
     def _login_porteria(self):
-        LoginWindow(self.winfo_toplevel(), "porteria")
+        self.pausar_camara()
+        LoginWindow(self.winfo_toplevel(), "porteria", on_close_sin_login=self.reanudar_camara)
 
     def _login_admin(self):
-        LoginWindow(self.winfo_toplevel(), "admin")
-
-
-# ═══════════════════════════════════════════════════════════════
-#  PANTALLA REGISTRO EXITOSO
-# ═══════════════════════════════════════════════════════════════
-class PantallaRegistroExitoso(BaseWindow):
-    SEGUNDOS = 3
-
-    def __init__(self, master, nombre, apellido, tipo):
-        super().__init__(master, "Registro Exitoso", WIN_EXITO)
-        self._segundos_restantes = self.SEGUNDOS
-        make_header(self, "RAE")
-
-        color_tipo = COLOR_GREEN if tipo == "Ingreso" else COLOR_BLUE
-        emoji_tipo = "✅" if tipo == "Ingreso" else "🚪"
-
-        tk.Label(self, text=emoji_tipo, font=("Segoe UI", 64),
-                 bg=BG_MAIN, fg=color_tipo).pack(pady=(34, 6))
-        tk.Label(self, text="¡Registro Exitoso!", bg=BG_MAIN,
-                 font=("Segoe UI", 20, "bold")).pack()
-
-        card = tk.Frame(self, bg=BG_CARD, bd=1, relief="solid", padx=36, pady=22)
-        card.pack(pady=20)
-        tk.Label(card, text=f"Tu {tipo.lower()} ha sido registrado correctamente.",
-                 bg=BG_CARD, font=FONT_NORMAL, fg=COLOR_GRAY).pack()
-        tk.Label(card, text=f"Estudiante: {nombre} {apellido}",
-                 bg=BG_CARD, font=FONT_HEADER).pack(pady=(10, 0))
-
-        self.btn_cerrar = make_btn(
-            self, f"Cerrar  ({self.SEGUNDOS})",
-            self.destroy, color=COLOR_GRAY, width=22
-        )
-        self.btn_cerrar.pack(pady=12)
-        self.after(1000, self._tick)
-
-    def _tick(self):
-        if not self.winfo_exists():
-            return
-        self._segundos_restantes -= 1
-        if self._segundos_restantes <= 0:
-            try:
-                self.destroy()
-            except tk.TclError:
-                pass
-        else:
-            try:
-                self.btn_cerrar.config(text=f"Cerrar  ({self._segundos_restantes})")
-                self.after(1000, self._tick)
-            except tk.TclError:
-                pass
+        self.pausar_camara()
+        LoginWindow(self.winfo_toplevel(), "admin", on_close_sin_login=self.reanudar_camara)
 
 
 # ═══════════════════════════════════════════════════════════════
 #  LOGIN
 # ═══════════════════════════════════════════════════════════════
 class LoginWindow(BaseWindow):
-    def __init__(self, master, rol_esperado):
+    def __init__(self, master, rol_esperado, on_close_sin_login=None):
         super().__init__(master, "Iniciar sesión", WIN_LOGIN)
         self.rol_esperado = rol_esperado
+        self.on_close_sin_login = on_close_sin_login
+        self._login_exitoso = False
         self._build()
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
 
     def _build(self):
         tk.Label(self, text="Iniciar Sesión", bg=BG_MAIN, font=FONT_TITLE).pack(pady=(36,24))
@@ -858,12 +904,18 @@ class LoginWindow(BaseWindow):
         if rol != self.rol_esperado:
             messagebox.showerror("Error", f"No tiene permisos de '{self.rol_esperado}'.")
             return
+        self._login_exitoso = True
         self.master.withdraw()
         self.destroy()
         if rol == "porteria":
             open_new_window(self.master, PanelPorteria, root=self.master)
         else:
             open_new_window(self.master, PanelAdministracion, root=self.master)
+
+    def _on_close(self):
+        if not self._login_exitoso and self.on_close_sin_login:
+            self.on_close_sin_login()
+        self.destroy()
 
 
 def open_new_window(master, cls, root=None):
@@ -874,6 +926,10 @@ def open_new_window(master, cls, root=None):
     def on_close():
         if root:
             root.deiconify()
+            # Si la ventana raíz tiene la pantalla de inicio con cámara, reanudarla
+            for child in root.winfo_children():
+                if isinstance(child, PantallaInicio):
+                    child.reanudar_camara()
         win.destroy()
     win.protocol("WM_DELETE_WINDOW", on_close)
     cls(win, root=root, close_callback=on_close)
@@ -1174,9 +1230,9 @@ class GestionEstudiantes(tk.Frame):
 
         self.e_buscar.bind("<KeyRelease>", self._on_key_buscar)
 
-        cols = ("ID","Nombre","Apellido","Grado","Rostro")
+        cols = ("ID","Nombre","Apellido","Codigo","Rostro")
         self.tree = ttk.Treeview(self, columns=cols, show="headings", height=14)
-        widths = {"ID":80,"Nombre":280,"Apellido":280,"Grado":130,"Rostro":150}
+        widths = {"ID":80,"Nombre":280,"Apellido":280,"Codigo":130,"Rostro":150}
         for col in cols:
             self.tree.heading(col, text=col)
             self.tree.column(col, width=widths[col])
@@ -1207,7 +1263,7 @@ class GestionEstudiantes(tk.Frame):
         conn = get_connection()
         c = conn.cursor()
         query = """
-            SELECT e.id, e.nombre, e.apellido, e.grado,
+            SELECT e.id, e.nombre, e.apellido, e.Codigo,
                    CASE WHEN f.id IS NOT NULL THEN '✅ Sí' ELSE '❌ No' END
             FROM estudiantes e
             LEFT JOIN estudiantes_faces f ON e.id = f.estudiante_id
@@ -1333,7 +1389,7 @@ class ConsultaHistorial(tk.Frame):
         self.tree.pack(side="left", fill="both", expand=True)
         sb.pack(side="right", fill="y")
 
-        self.tree.tag_configure("dentro", foreground=COLOR_GREEN)
+        self.tree.tag_configure("Entro", foreground=COLOR_GREEN)
         self.tree.tag_configure("fuera",  foreground=COLOR_BLUE)
 
         self._row_meta = {}
