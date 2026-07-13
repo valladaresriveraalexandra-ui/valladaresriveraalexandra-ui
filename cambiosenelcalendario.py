@@ -1,3 +1,4 @@
+
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 import sqlite3
@@ -12,17 +13,32 @@ from PIL import Image, ImageTk
 import csv
 import os
 import tempfile
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+import calendar
+
+# ==================== CONFIGURACIÓN DE CORREO ====================
+SMTP_CONFIG = {
+    "host": "smtp.gmail.com",
+    "port": 587,
+    "user": "raeinstituto@gmail.com",
+    "password": "ulhr dmfr zoby fjcl"
+}
+INSTITUCION_NOMBRE = "INSTITUTO NACIONAL TECNICO INDUSTRIAL"
+CORREO_REPORTES = "riverale610@gmail.com"
 
 # ==================== CONSTANTES ====================
 WIN_MAIN   = "1400x900"
 WIN_PANEL  = "1400x900"
 WIN_INNER  = "1400x900"
-WIN_FORM   = "540x640"
+WIN_FORM   = "600x700"
 WIN_CAMARA = "900x900"
 WIN_CAPTU  = "780x620"
 WIN_EXITO  = "680x440"
-WIN_LOGIN  = "480x340"
+WIN_LOGIN  = "500x400"
 WIN_DET    = "860x500"
+WIN_REPORTES = "1100x700"
 
 BG_MAIN    = "#f0f2f5"
 BG_HEADER  = "#d9dde3"
@@ -49,6 +65,15 @@ DURACION_MENSAJE_EXITO = 1.0
 
 HORA_LIMITE_ENTRADA = "07:00 AM"
 HORA_LIMITE_SALIDA  = "12:00 PM"
+
+# ==================== VENTANA BASE ====================
+class BaseWindow(tk.Toplevel):
+    def __init__(self, master, title="RAE", size=WIN_PANEL):
+        super().__init__(master)
+        self.title(title)
+        self.geometry(size)
+        self.configure(bg=BG_MAIN)
+        self.resizable(True, True)
 
 # ==================== PUNTUALIDAD ====================
 def _parsear_hora(hora_str):
@@ -86,11 +111,12 @@ def init_db():
             nombre   TEXT NOT NULL,
             apellido TEXT NOT NULL,
             grado    TEXT NOT NULL,
-            password TEXT NOT NULL DEFAULT '1234'
+            password TEXT NOT NULL DEFAULT '1234',
+            email_encargado TEXT
         )
     """)
     try:
-        c.execute("ALTER TABLE estudiantes ADD COLUMN password TEXT NOT NULL DEFAULT '1234'")
+        c.execute("ALTER TABLE estudiantes ADD COLUMN email_encargado TEXT")
     except sqlite3.OperationalError:
         pass
 
@@ -126,8 +152,10 @@ def init_db():
     c.execute("SELECT COUNT(*) FROM estudiantes")
     if c.fetchone()[0] == 0:
         c.executemany(
-            "INSERT INTO estudiantes (nombre, apellido, grado, password) VALUES (?,?,?,?)",
-            [("Juan","Pérez","5to","1234"),("María","García","6to","1234"),("Carlos","Rodríguez","5to","1234")]
+            "INSERT INTO estudiantes (nombre, apellido, grado, password, email_encargado) VALUES (?,?,?,?,?)",
+            [("Juan","Pérez","5to","1234","juan@correo.com"),
+             ("María","García","6to","1234","maria@correo.com"),
+             ("Carlos","Rodríguez","5to","1234","carlos@correo.com")]
         )
     c.execute("SELECT COUNT(*) FROM usuarios")
     if c.fetchone()[0] == 0:
@@ -293,45 +321,103 @@ def mostrar_toast(master, mensaje, color=COLOR_GREEN, duracion=3000):
     toast.geometry(f"+{rx - tw//2}+{ry - th//2}")
     toast.after(duracion, toast.destroy)
 
-def realizar_registro_db(est_id, nombre, apellido, master=None):
-    now   = datetime.now()
-    fecha = now.strftime("%Y-%m-%d")
-    hora  = now.strftime("%I:%M %p")
-    conn = get_connection()
-    c    = conn.cursor()
-    c.execute(
-        "SELECT tipo FROM registros WHERE estudiante_id=? AND fecha=? ORDER BY id DESC LIMIT 1",
-        (est_id, fecha)
-    )
-    ultimo = c.fetchone()
-    tipo = "Salida" if ultimo and ultimo[0] == "Ingreso" else "Ingreso"
+# ==================== ENVÍO DE CORREOS ====================
+def enviar_correo(para, asunto, cuerpo):
+    try:
+        msg = MIMEMultipart()
+        msg['From'] = SMTP_CONFIG['user']
+        msg['To'] = para
+        msg['Subject'] = asunto
+        msg.attach(MIMEText(cuerpo, 'plain', 'utf-8'))
+        server = smtplib.SMTP(SMTP_CONFIG['host'], SMTP_CONFIG['port'])
+        server.starttls()
+        server.login(SMTP_CONFIG['user'], SMTP_CONFIG['password'])
+        server.send_message(msg)
+        server.quit()
+        return True
+    except Exception as e:
+        print(f"Error al enviar correo: {e}")
+        return False
 
-    if tipo == "Ingreso":
-        puntualidad = evaluar_puntualidad_entrada(hora)
-    else:
-        puntualidad = evaluar_puntualidad_salida(hora)
+def enviar_correo_permiso(estudiante_nombre, fecha, hora, correo_encargado, motivo=None):
+    if not correo_encargado:
+        return False
+    asunto = f"Notificación de permiso - {INSTITUCION_NOMBRE}"
+    motivo_texto = motivo if motivo else "No especificado"
+    cuerpo = f"""
+Estimado encargado,
 
-    observacion = f"Registrado automáticamente — {puntualidad}"
-    c.execute(
-        "INSERT INTO registros (estudiante_id, tipo, fecha, hora, observaciones) VALUES (?,?,?,?,?)",
-        (est_id, tipo, fecha, hora, observacion)
-    )
-    conn.commit()
-    conn.close()
-    if master:
-        color   = COLOR_GREEN if tipo == "Ingreso" else COLOR_BLUE
-        emoji   = "✅" if tipo == "Ingreso" else "🚪"
-        mensaje = f"{emoji}  {nombre} {apellido}  —  {tipo} registrado  ({puntualidad})"
-        mostrar_toast(master, mensaje, color=color, duracion=3000)
-    return tipo, nombre, apellido, puntualidad
+Se le informa que el estudiante {estudiante_nombre} ha solicitado un permiso de salida de la institución.
 
-class BaseWindow(tk.Toplevel):
-    def __init__(self, master, title="RAE", size=WIN_PANEL):
-        super().__init__(master)
-        self.title(title)
-        self.geometry(size)
-        self.configure(bg=BG_MAIN)
-        self.resizable(True, True)
+Fecha: {fecha}
+Hora: {hora}
+Motivo: {motivo_texto}
+
+Este permiso fue registrado en el sistema de asistencia de {INSTITUCION_NOMBRE}.
+
+Atentamente,
+Sistema de Registro de Asistencia Estudiantil (RAE)
+{INSTITUCION_NOMBRE}
+    """
+    return enviar_correo(correo_encargado, asunto, cuerpo)
+
+def enviar_correo_entrada_tardia(estudiante_nombre, fecha, hora, correo_encargado):
+    if not correo_encargado:
+        return False
+    asunto = f"Entrada tardía - {INSTITUCION_NOMBRE}"
+    cuerpo = f"""
+Estimado encargado,
+
+Se le informa que el estudiante {estudiante_nombre} ha registrado una entrada tardía hoy {fecha} a las {hora}.
+
+La hora límite de entrada es {HORA_LIMITE_ENTRADA}.
+
+Atentamente,
+Sistema de Registro de Asistencia Estudiantil (RAE)
+{INSTITUCION_NOMBRE}
+    """
+    return enviar_correo(correo_encargado, asunto, cuerpo)
+
+def enviar_correo_salida_anticipada(estudiante_nombre, fecha, hora, correo_encargado):
+    if not correo_encargado:
+        return False
+    asunto = f"Salida anticipada - {INSTITUCION_NOMBRE}"
+    cuerpo = f"""
+Estimado encargado,
+
+Se le informa que el estudiante {estudiante_nombre} ha registrado una salida anticipada hoy {fecha} a las {hora}.
+
+La hora límite de salida es {HORA_LIMITE_SALIDA}.
+
+Atentamente,
+Sistema de Registro de Asistencia Estudiantil (RAE)
+{INSTITUCION_NOMBRE}
+    """
+    return enviar_correo(correo_encargado, asunto, cuerpo)
+
+def enviar_reporte_por_correo(destinatarios, fecha, datos_permisos):
+    if not destinatarios or not datos_permisos:
+        return False
+    asunto = f"Reporte de permisos - {INSTITUCION_NOMBRE} - {fecha}"
+    lineas = []
+    lineas.append("=" * 60)
+    lineas.append(f"REPORTE DE PERMISOS - {INSTITUCION_NOMBRE}")
+    lineas.append(f"Fecha: {fecha}")
+    lineas.append("=" * 60)
+    lineas.append(f"{'N°':<6} {'Estudiante':<30} {'Hora':<12} {'Motivo':<20} {'Correo Encargado':<30}")
+    lineas.append("-" * 60)
+    for permiso in datos_permisos:
+        lineas.append(f"{permiso[0]:<6} {permiso[1]:<30} {permiso[2]:<12} {permiso[3]:<20} {permiso[4]:<30}")
+    lineas.append("-" * 60)
+    lineas.append(f"Total de permisos: {len(datos_permisos)}")
+    lineas.append("=" * 60)
+    cuerpo = "\n".join(lineas)
+    exito = True
+    for dest in destinatarios:
+        if dest and dest.strip():
+            if not enviar_correo(dest.strip(), asunto, cuerpo):
+                exito = False
+    return exito
 
 # ==================== CAPTURA DE ROSTRO ====================
 class CapturaRostro(BaseWindow):
@@ -445,14 +531,15 @@ class FormEstudiante(BaseWindow):
 
         def campo(label, row, show=None):
             tk.Label(card, text=label+":", bg=BG_CARD, font=FONT_NORMAL).grid(row=row, column=0, sticky="w", pady=6)
-            e = tk.Entry(card, font=FONT_NORMAL, width=24, bd=1, relief="solid", show=show)
+            e = tk.Entry(card, font=FONT_NORMAL, width=28, bd=1, relief="solid", show=show)
             e.grid(row=row, column=1, padx=(10,0), pady=6, ipady=6)
             return e
 
         self.e_nombre   = campo("Nombre",    0)
         self.e_apellido = campo("Apellido",  1)
-        self.e_grado    = campo("Grado",     2)
+        self.e_grado    = campo("Código",    2)
         self.e_password = campo("Contraseña",3, show="*")
+        self.e_email    = campo("Correo encargado", 4)
 
         self.btn_capturar = tk.Button(
             card, text="📸  Capturar Rostro",
@@ -460,16 +547,16 @@ class FormEstudiante(BaseWindow):
             bg=COLOR_GRAY, fg="white", font=FONT_BTN,
             relief="flat", cursor="hand2", padx=12, pady=8, width=24
         )
-        self.btn_capturar.grid(row=4, column=0, columnspan=2, pady=16)
+        self.btn_capturar.grid(row=5, column=0, columnspan=2, pady=16)
 
         self.lbl_rostro = tk.Label(card, text="Sin rostro capturado",
                                    bg=BG_CARD, font=FONT_SMALL, fg=COLOR_GRAY)
-        self.lbl_rostro.grid(row=5, column=0, columnspan=2)
+        self.lbl_rostro.grid(row=6, column=0, columnspan=2)
 
         if self.est_id:
             conn = get_connection()
             c = conn.cursor()
-            c.execute("SELECT nombre, apellido, grado, password FROM estudiantes WHERE id=?", (self.est_id,))
+            c.execute("SELECT nombre, apellido, grado, password, email_encargado FROM estudiantes WHERE id=?", (self.est_id,))
             row = c.fetchone()
             c.execute("SELECT COUNT(*) FROM estudiantes_faces WHERE estudiante_id=?", (self.est_id,))
             tiene_rostro = c.fetchone()[0] > 0
@@ -479,6 +566,7 @@ class FormEstudiante(BaseWindow):
                 self.e_apellido.insert(0, row[1])
                 self.e_grado.insert(0, row[2])
                 self.e_password.insert(0, row[3])
+                self.e_email.insert(0, row[4] if row[4] else "")
             if tiene_rostro:
                 self.lbl_rostro.config(text="✅ Rostro ya registrado en BD", fg=COLOR_GREEN)
                 self.btn_capturar.config(text="📸  Actualizar Rostro")
@@ -505,22 +593,23 @@ class FormEstudiante(BaseWindow):
         apellido = self.e_apellido.get().strip()
         grado    = self.e_grado.get().strip()
         password = self.e_password.get().strip()
+        email    = self.e_email.get().strip()
         if not nombre or not apellido or not grado or not password:
-            messagebox.showwarning("Campos vacíos", "Complete todos los campos.")
+            messagebox.showwarning("Campos vacíos", "Complete todos los campos (excepto correo).")
             return
         conn = get_connection()
         c = conn.cursor()
         try:
             if self.est_id:
                 c.execute(
-                    "UPDATE estudiantes SET nombre=?, apellido=?, grado=?, password=? WHERE id=?",
-                    (nombre, apellido, grado, password, self.est_id)
+                    "UPDATE estudiantes SET nombre=?, apellido=?, grado=?, password=?, email_encargado=? WHERE id=?",
+                    (nombre, apellido, grado, password, email, self.est_id)
                 )
                 id_guardado = self.est_id
             else:
                 c.execute(
-                    "INSERT INTO estudiantes (nombre, apellido, grado, password) VALUES (?,?,?,?)",
-                    (nombre, apellido, grado, password)
+                    "INSERT INTO estudiantes (nombre, apellido, grado, password, email_encargado) VALUES (?,?,?,?,?)",
+                    (nombre, apellido, grado, password, email)
                 )
                 id_guardado = c.lastrowid
                 self.est_id = id_guardado
@@ -871,8 +960,8 @@ class PantallaInicio(tk.Frame):
         if self.motor:
             self.motor.confirmar_registro(est_id)
 
-        color_txt = COLOR_GREEN if tipo == "Ingreso" else COLOR_BLUE
-        emoji = "✅" if tipo == "Ingreso" else "🚪"
+        color_txt = COLOR_GREEN if tipo == "Ingreso" else (COLOR_ORANGE if tipo == "Permiso" else COLOR_BLUE)
+        emoji = "✅" if tipo == "Ingreso" else ("📝" if tipo == "Permiso" else "🚪")
 
         self.lbl_overlay_icono.config(text=emoji)
         self.lbl_overlay_texto.config(text=f"{nombre} {apellido}\n{tipo} registrado\n{puntualidad}")
@@ -1159,22 +1248,28 @@ class PanelPorteria(tk.Frame):
                         filas.append((nombre_est, fch, pendiente_ingreso, "—", "dentro", est_id, pendiente_id, None))
                     pendiente_ingreso = hora
                     pendiente_id = reg_id
-                elif tipo == "Salida":
+                else:  # Salida o Permiso
                     if pendiente_ingreso is not None:
-                        filas.append((nombre_est, fch, pendiente_ingreso, hora, "fuera", est_id, pendiente_id, reg_id))
+                        filas.append((nombre_est, fch, pendiente_ingreso, hora, "fuera", est_id, pendiente_id, reg_id, tipo))
                         pendiente_ingreso = None
                         pendiente_id = None
                     else:
-                        filas.append((nombre_est, fch, "—", hora, "fuera", est_id, None, reg_id))
+                        filas.append((nombre_est, fch, "—", hora, "fuera", est_id, None, reg_id, tipo))
             if pendiente_ingreso is not None:
-                filas.append((nombre_est, fch, pendiente_ingreso, "—", "dentro", est_id, pendiente_id, None))
+                filas.append((nombre_est, fch, pendiente_ingreso, "—", "dentro", est_id, pendiente_id, None, None))
 
         filas.sort(key=lambda x: (x[1], x[2]), reverse=True)
 
-        for (nombre_est, fch, h_entrada, h_salida, tag, est_id, entrada_id, salida_id) in filas:
+        for (nombre_est, fch, h_entrada, h_salida, tag, est_id, entrada_id, salida_id, tipo_salida) in filas:
             estado_txt = "✅ Adentro" if tag == "dentro" else "🚪 Salió"
             punt_entrada = evaluar_puntualidad_entrada(h_entrada) if h_entrada != "—" else "—"
-            punt_salida  = evaluar_puntualidad_salida(h_salida) if h_salida != "—" else "—"
+            if h_salida != "—":
+                if tipo_salida == "Permiso":
+                    punt_salida = "🟢 Con permiso"
+                else:
+                    punt_salida = evaluar_puntualidad_salida(h_salida)
+            else:
+                punt_salida = "—"
             self.tree.insert("", "end",
                              values=(nombre_est, fch, h_entrada, punt_entrada,
                                      h_salida, punt_salida, estado_txt),
@@ -1252,6 +1347,7 @@ class PanelAdministracion(tk.Frame):
         for icon, label, cmd in [
             ("👥","Gestionar estudiantes", self._gestionar_estudiantes),
             ("🕐","Consultar historial",   self._consultar_historial),
+            ("📊","Reportes",               self._reportes),
         ]:
             f = tk.Frame(cards_frame, bg=BG_CARD, bd=1, relief="solid", padx=36, pady=36)
             f.pack(side="left", padx=20, ipadx=12)
@@ -1268,6 +1364,9 @@ class PanelAdministracion(tk.Frame):
     def _consultar_historial(self):
         open_inner_window(self._master_win, ConsultaHistorial, root=self.root)
 
+    def _reportes(self):
+        open_inner_window(self._master_win, PanelReportes, root=self.root, close_callback=None)
+
     def _logout(self):
         if self.close_callback:
             self.close_callback()
@@ -1275,6 +1374,142 @@ class PanelAdministracion(tk.Frame):
             self.winfo_toplevel().destroy()
             if self.root:
                 self.root.deiconify()
+
+# ==================== PANEL DE REPORTES (CON TABLA, SIN GENERAR REPORTE) ====================
+class PanelReportes(tk.Frame):
+    def __init__(self, master, root=None, close_callback=None):
+        super().__init__(master, bg=BG_MAIN)
+        self.root = root
+        self.close_callback = close_callback
+        self.lista_estudiantes_ids = []
+        self.pack(fill="both", expand=True)
+        self._build()
+
+    def _build(self):
+        make_header(self, "RAE")
+        make_navbar(self, [
+            ("Volver", self.winfo_toplevel().destroy),
+        ])
+
+        tk.Label(self, text="Gestión de Permisos y Reportes", bg=BG_MAIN, font=FONT_TITLE).pack(anchor="w", padx=24, pady=12)
+
+        # ---- Sección: Registrar Permiso ----
+        frame_reg = tk.Frame(self, bg=BG_CARD, bd=1, relief="solid", padx=18, pady=18)
+        frame_reg.pack(fill="x", padx=24, pady=(0,12))
+        tk.Label(frame_reg, text="Registrar un permiso", bg=BG_CARD, font=FONT_HEADER).grid(row=0, column=0, columnspan=4, sticky="w", pady=(0,10))
+
+        tk.Label(frame_reg, text="Estudiante:", bg=BG_CARD, font=FONT_NORMAL).grid(row=1, column=0, sticky="w")
+        self.combo_estudiantes = ttk.Combobox(frame_reg, font=FONT_NORMAL, width=40)
+        self.combo_estudiantes.grid(row=1, column=1, padx=(8,20), pady=6)
+        self._cargar_estudiantes()
+
+        tk.Label(frame_reg, text="Motivo (opcional):", bg=BG_CARD, font=FONT_NORMAL).grid(row=1, column=2, sticky="w")
+        self.entry_motivo = tk.Entry(frame_reg, font=FONT_NORMAL, width=30, bd=1, relief="solid")
+        self.entry_motivo.grid(row=1, column=3, padx=(8,0), pady=6, ipady=6)
+
+        make_btn(frame_reg, "📝 Registrar Permiso", self._registrar_permiso, color=COLOR_ORANGE, width=22).grid(row=2, column=0, columnspan=2, sticky="w", pady=10)
+
+        # ---- Tabla de permisos registrados ----
+        res = tk.Frame(self, bg=BG_CARD, bd=1, relief="solid", padx=18, pady=16)
+        res.pack(fill="both", expand=True, padx=24, pady=(0,18))
+        tk.Label(res, text="Permisos registrados", bg=BG_CARD, font=FONT_HEADER).pack(anchor="w", pady=(0,10))
+
+        cols = ("ID", "Estudiante", "Fecha", "Hora", "Motivo", "Correo Encargado")
+        self.tree = ttk.Treeview(res, columns=cols, show="headings", height=12)
+        widths = {"ID":60, "Estudiante":300, "Fecha":120, "Hora":120, "Motivo":250, "Correo Encargado":280}
+        for col in cols:
+            self.tree.heading(col, text=col)
+            self.tree.column(col, width=widths[col], anchor="center" if col != "Estudiante" else "w")
+
+        sb = ttk.Scrollbar(res, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=sb.set)
+        self.tree.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+
+        self.tree.tag_configure("permiso", foreground=COLOR_ORANGE)
+
+        # Cargar permisos existentes al abrir
+        self._cargar_permisos()
+
+    def _cargar_estudiantes(self):
+        conn = get_connection()
+        c = conn.cursor()
+        c.execute("SELECT id, nombre||' '||apellido FROM estudiantes ORDER BY nombre")
+        rows = c.fetchall()
+        conn.close()
+        self.lista_estudiantes_ids = [row[0] for row in rows]
+        opciones = [f"{i+1} - {row[1]}" for i, row in enumerate(rows)]
+        self.combo_estudiantes['values'] = opciones
+        if opciones:
+            self.combo_estudiantes.current(0)
+
+    def _cargar_permisos(self, fecha=None):
+        """Carga los permisos registrados en la tabla (por defecto todos, o filtrando por fecha)."""
+        for row in self.tree.get_children():
+            self.tree.delete(row)
+
+        if not fecha:
+            fecha = datetime.now().strftime("%Y-%m-%d")
+
+        conn = get_connection()
+        c = conn.cursor()
+        c.execute("""
+            SELECT r.id, e.nombre||' '||e.apellido, r.fecha, r.hora, r.observaciones, e.email_encargado
+            FROM registros r
+            JOIN estudiantes e ON r.estudiante_id = e.id
+            WHERE r.tipo = 'Permiso' AND r.fecha = ?
+            ORDER BY r.id ASC
+        """, (fecha,))
+        rows = c.fetchall()
+        conn.close()
+
+        for idx, (reg_id, estudiante, fecha_r, hora, obs, email) in enumerate(rows, start=1):
+            motivo = obs.replace("Permiso otorgado", "").strip(" -")
+            correo_mostrar = email if email else ""
+            self.tree.insert("", 0, values=(idx, estudiante, fecha_r, hora, motivo, correo_mostrar), tags=("permiso",))
+
+    def _registrar_permiso(self):
+        idx = self.combo_estudiantes.current()
+        if idx < 0:
+            messagebox.showwarning("Selección requerida", "Seleccione un estudiante.")
+            return
+        try:
+            est_id = self.lista_estudiantes_ids[idx]
+        except IndexError:
+            messagebox.showerror("Error", "No se pudo obtener el ID del estudiante.")
+            return
+
+        motivo = self.entry_motivo.get().strip()
+        conn = get_connection()
+        c = conn.cursor()
+        c.execute("SELECT nombre, apellido, email_encargado FROM estudiantes WHERE id=?", (est_id,))
+        row = c.fetchone()
+        conn.close()
+        if not row:
+            messagebox.showerror("Error", "Estudiante no encontrado.")
+            return
+        nombre, apellido, email = row
+        ahora = datetime.now()
+        fecha = ahora.strftime("%Y-%m-%d")
+        hora = ahora.strftime("%I:%M %p")
+        observacion = f"Permiso otorgado" + (f" - Motivo: {motivo}" if motivo else "")
+        conn = get_connection()
+        c = conn.cursor()
+        c.execute("""
+            INSERT INTO registros (estudiante_id, tipo, fecha, hora, observaciones, registrado_por)
+            VALUES (?, 'Permiso', ?, ?, ?, 'Administrador')
+        """, (est_id, fecha, hora, observacion))
+        conn.commit()
+        conn.close()
+        mostrar_toast(self.winfo_toplevel(), f"📝 Permiso registrado para {nombre} {apellido}", color=COLOR_ORANGE)
+        self.entry_motivo.delete(0, "end")
+        # Actualizar la tabla
+        self._cargar_permisos(fecha)
+        if email:
+            if enviar_correo_permiso(f"{nombre} {apellido}", fecha, hora, email, motivo):
+                mostrar_toast(self.winfo_toplevel(), f"Correo enviado a {email}", color=COLOR_GREEN, duracion=3000)
+            else:
+                mostrar_toast(self.winfo_toplevel(), f"No se pudo enviar a {email}", color=COLOR_RED, duracion=3000)
 
 # ==================== GESTIÓN DE ESTUDIANTES ====================
 class GestionEstudiantes(tk.Frame):
@@ -1315,9 +1550,9 @@ class GestionEstudiantes(tk.Frame):
 
         self.e_buscar.bind("<KeyRelease>", self._on_key_buscar)
 
-        cols = ("ID","Nombre","Apellido","Grado","Rostro")
+        cols = ("ID","Nombre","Apellido","Código","Rostro","Correo Encargado")
         self.tree = ttk.Treeview(self, columns=cols, show="headings", height=14)
-        widths = {"ID":80,"Nombre":280,"Apellido":280,"Grado":130,"Rostro":150}
+        widths = {"ID":60,"Nombre":220,"Apellido":220,"Código":100,"Rostro":100,"Correo Encargado":250}
         for col in cols:
             self.tree.heading(col, text=col)
             self.tree.column(col, width=widths[col])
@@ -1348,7 +1583,7 @@ class GestionEstudiantes(tk.Frame):
         conn = get_connection()
         c = conn.cursor()
         query = """
-            SELECT e.id, e.nombre, e.apellido, e.grado,
+            SELECT e.id, e.nombre, e.apellido, e.grado, e.email_encargado,
                    CASE WHEN f.id IS NOT NULL THEN '✅ Sí' ELSE '❌ No' END
             FROM estudiantes e
             LEFT JOIN estudiantes_faces f ON e.id = f.estudiante_id
@@ -1364,7 +1599,7 @@ class GestionEstudiantes(tk.Frame):
 
         for seq_num, row in enumerate(rows, start=1):
             real_id = row[0]
-            display_row = (seq_num,) + row[1:]
+            display_row = (seq_num,) + row[1:4] + (row[5], row[4])
             iid = self.tree.insert("", "end", values=display_row)
             self._real_ids[iid] = real_id
 
@@ -1402,7 +1637,136 @@ class GestionEstudiantes(tk.Frame):
             self._cargar_todos()
             messagebox.showinfo("Listo","Estudiante eliminado.")
 
-# ==================== CONSULTA HISTORIAL (CORREGIDA) ====================
+# ==================== CALENDARIO EMERGENTE ====================
+class CalendarDialog(tk.Toplevel):
+    def __init__(self, master, fecha_inicial=None, callback=None):
+        super().__init__(master)
+        self.title("Seleccionar fecha")
+        self.geometry("300x260")
+        self.configure(bg=BG_MAIN)
+        self.callback = callback
+        self.fecha = None
+
+        # Año y mes actuales
+        if fecha_inicial:
+            try:
+                dt = datetime.strptime(fecha_inicial, "%Y-%m-%d")
+                self.anio = dt.year
+                self.mes = dt.month
+            except:
+                hoy = datetime.now()
+                self.anio = hoy.year
+                self.mes = hoy.month
+        else:
+            hoy = datetime.now()
+            self.anio = hoy.year
+            self.mes = hoy.month
+
+        self._build()
+        self._render_calendario()
+
+    def _build(self):
+        # Barra de navegación
+        nav = tk.Frame(self, bg=BG_HEADER)
+        nav.pack(fill="x", padx=10, pady=5)
+        btn_prev = tk.Button(nav, text="◀", command=self._mes_anterior,
+                             font=("Segoe UI", 10, "bold"), bg=BG_HEADER, relief="flat")
+        btn_prev.pack(side="left")
+        self.lbl_mes_anio = tk.Label(nav, text="", bg=BG_HEADER,
+                                     font=("Segoe UI", 12, "bold"))
+        self.lbl_mes_anio.pack(side="left", expand=True)
+        btn_next = tk.Button(nav, text="▶", command=self._mes_siguiente,
+                             font=("Segoe UI", 10, "bold"), bg=BG_HEADER, relief="flat")
+        btn_next.pack(side="right")
+
+        # Contenedor de días
+        self.frame_dias = tk.Frame(self, bg=BG_WHITE)
+        self.frame_dias.pack(fill="both", expand=True, padx=10, pady=5)
+
+        # Botón de hoy
+        btn_hoy = tk.Button(self, text="Hoy", command=self._seleccionar_hoy,
+                            bg=COLOR_BLUE, fg="white", font=FONT_BTN,
+                            relief="flat", padx=10, pady=5)
+        btn_hoy.pack(pady=5)
+
+        self.protocol("WM_DELETE_WINDOW", self._cancelar)
+
+    def _render_calendario(self):
+        # Limpiar frame
+        for widget in self.frame_dias.winfo_children():
+            widget.destroy()
+
+        # Actualizar título
+        self.lbl_mes_anio.config(text=f"{calendar.month_name[self.mes]} {self.anio}")
+
+        # Días de la semana
+        dias_semana = ["Lu", "Ma", "Mi", "Ju", "Vi", "Sá", "Do"]
+        for i, dia in enumerate(dias_semana):
+            lbl = tk.Label(self.frame_dias, text=dia, bg=BG_WHITE,
+                           font=("Segoe UI", 9, "bold"), fg=COLOR_GRAY)
+            lbl.grid(row=0, column=i, padx=2, pady=2, sticky="nsew")
+
+        # Obtener el primer día del mes y número de días
+        primer_dia, num_dias = calendar.monthrange(self.anio, self.mes)
+        # Ajustar: calendar devuelve 0=Lunes, 1=Martes, ... 6=Domingo
+        # Pero en nuestra grilla queremos que la columna 0 sea Lunes
+        # Ya lo tenemos así porque calendar.monthrange devuelve 0=Lunes
+        columna_inicio = primer_dia
+
+        # Crear botones para cada día
+        for dia in range(1, num_dias + 1):
+            fila = (dia + columna_inicio - 1) // 7 + 1
+            col = (dia + columna_inicio - 1) % 7
+            btn = tk.Button(self.frame_dias, text=str(dia),
+                            bg=BG_WHITE, relief="flat",
+                            font=("Segoe UI", 10),
+                            command=lambda d=dia: self._seleccionar_dia(d))
+            btn.grid(row=fila, column=col, padx=2, pady=2, sticky="nsew")
+            # Resaltar día actual
+            hoy = datetime.now()
+            if dia == hoy.day and self.anio == hoy.year and self.mes == hoy.month:
+                btn.config(bg=COLOR_LIGHT)
+
+        # Ajustar columnas
+        for col in range(7):
+            self.frame_dias.columnconfigure(col, weight=1)
+
+    def _mes_anterior(self):
+        if self.mes == 1:
+            self.mes = 12
+            self.anio -= 1
+        else:
+            self.mes -= 1
+        self._render_calendario()
+
+    def _mes_siguiente(self):
+        if self.mes == 12:
+            self.mes = 1
+            self.anio += 1
+        else:
+            self.mes += 1
+        self._render_calendario()
+
+    def _seleccionar_dia(self, dia):
+        fecha_str = f"{self.anio:04d}-{self.mes:02d}-{dia:02d}"
+        self.fecha = fecha_str
+        if self.callback:
+            self.callback(fecha_str)
+        self.destroy()
+
+    def _seleccionar_hoy(self):
+        hoy = datetime.now()
+        fecha_str = hoy.strftime("%Y-%m-%d")
+        self.fecha = fecha_str
+        if self.callback:
+            self.callback(fecha_str)
+        self.destroy()
+
+    def _cancelar(self):
+        self.fecha = None
+        self.destroy()
+
+# ==================== CONSULTA HISTORIAL (MODIFICADO CON CALENDARIO) ====================
 class ConsultaHistorial(tk.Frame):
     def __init__(self, master, root=None, close_callback=None):
         super().__init__(master, bg=BG_MAIN)
@@ -1425,9 +1789,6 @@ class ConsultaHistorial(tk.Frame):
         btn_frame = tk.Frame(top, bg=BG_MAIN)
         btn_frame.pack(side="right")
 
-        # Checkbox "Seleccionar todo" — se usa tk.Checkbutton (no ttk) para que el
-        # texto se muestre completo, sin el recuadro punteado de foco de ttk que
-        # lo recortaba visualmente.
         self.select_all_var = tk.BooleanVar(value=False)
         self.select_all_cb = tk.Checkbutton(
             btn_frame,
@@ -1462,12 +1823,23 @@ class ConsultaHistorial(tk.Frame):
         self.e_nombre.pack(pady=6, ipady=7)
         self.e_nombre.bind("<KeyRelease>", self._on_key_buscar)
 
+        # ----- Aquí va el nuevo campo de fecha con calendario -----
         right = tk.Frame(filt, bg=BG_CARD)
         right.pack(side="left")
         tk.Label(right, text="Fecha (AAAA-MM-DD) — opcional:", bg=BG_CARD, font=FONT_NORMAL).pack(anchor="w")
-        self.e_fecha = tk.Entry(right, font=FONT_NORMAL, width=26, bd=1, relief="solid")
-        self.e_fecha.pack(pady=6, ipady=7)
+
+        fecha_frame = tk.Frame(right, bg=BG_CARD)
+        fecha_frame.pack(pady=6)
+
+        self.e_fecha = tk.Entry(fecha_frame, font=FONT_NORMAL, width=22, bd=1, relief="solid")
+        self.e_fecha.pack(side="left", ipady=7)
         self.e_fecha.bind("<KeyRelease>", self._on_key_buscar)
+
+        btn_calendario = tk.Button(fecha_frame, text="📅", font=("Segoe UI", 12),
+                                   bg=COLOR_GRAY, fg="white", relief="flat",
+                                   command=self._abrir_calendario, cursor="hand2")
+        btn_calendario.pack(side="left", padx=(4,0))
+        # ----- Fin modificación -----
 
         tk.Label(filt, text="(Sin fecha = todo el historial)\nLa lista se actualiza automáticamente",
                  bg=BG_CARD, font=("Segoe UI", 10), fg=COLOR_GRAY,
@@ -1499,39 +1871,39 @@ class ConsultaHistorial(tk.Frame):
         self.tree.tag_configure("fuera",  foreground=COLOR_BLUE)
 
         self.tree.bind("<Button-1>", self._on_tree_click)
-        # Mantiene la casilla "Sel" de cada fila sincronizada con la selección
-        # real del Treeview (clic normal, Ctrl+clic, Shift+clic, etc.)
         self.tree.bind("<<TreeviewSelect>>", self._on_tree_select)
 
         self._row_meta = {}
         self._buscar()
 
+    def _abrir_calendario(self):
+        fecha_actual = self.e_fecha.get().strip()
+        CalendarDialog(self.winfo_toplevel(), fecha_actual, self._actualizar_fecha)
+
+    def _actualizar_fecha(self, fecha_str):
+        self.e_fecha.delete(0, "end")
+        self.e_fecha.insert(0, fecha_str)
+        self._buscar()
+
+    # ------------------- El resto de métodos de ConsultaHistorial se mantienen igual -------------------
     def _on_tree_click(self, event):
         region = self.tree.identify_region(event.x, event.y)
         if region != "cell":
             return
         col = self.tree.identify_column(event.x, event.y)
-        if col != "#1":  # La primera columna definida es "Sel"
+        if col != "#1":
             return
         iid = self.tree.identify_row(event.y)
         if not iid:
             return
-        # En lugar de solo cambiar el texto de la casilla, se marca/desmarca la
-        # fila en la SELECCIÓN REAL del Treeview. Así "Sel" y la selección
-        # (la que usan Eliminar / Exportar / Imprimir) son siempre lo mismo.
         seleccion_actual = set(self.tree.selection())
         if iid in seleccion_actual:
             self.tree.selection_remove(iid)
         else:
             self.tree.selection_add(iid)
-        # Evita que el clic también dispare la selección "normal" (de una sola
-        # fila) del Treeview, lo que borraría el resto de filas ya marcadas.
         return "break"
 
     def _on_tree_select(self, event=None):
-        # Se ejecuta cada vez que cambia la selección real del Treeview
-        # (clic en una fila, Ctrl/Shift+clic, "Seleccionar todo", etc.)
-        # y actualiza el texto ☐/☑ de la columna "Sel" para que coincida.
         seleccionados = set(self.tree.selection())
         for iid in self.tree.get_children():
             valores = list(self.tree.item(iid, "values"))
@@ -1547,8 +1919,6 @@ class ConsultaHistorial(tk.Frame):
             self.tree.selection_set(todos)
         else:
             self.tree.selection_remove(self.tree.selection())
-        # El evento <<TreeviewSelect>> disparado por selection_set/selection_remove
-        # ya actualiza las casillas ☐/☑ mediante _on_tree_select.
 
     def _actualizar_select_all(self):
         todos = self.tree.get_children()
@@ -1607,25 +1977,31 @@ class ConsultaHistorial(tk.Frame):
             for tipo, hora, reg_id in movs:
                 if tipo == "Ingreso":
                     if pendiente_ingreso is not None:
-                        filas.append((nombre_est, fch, pendiente_ingreso, "—", "dentro", est_id, pendiente_id, None))
+                        filas.append((nombre_est, fch, pendiente_ingreso, "—", "dentro", est_id, pendiente_id, None, None))
                     pendiente_ingreso = hora
                     pendiente_id = reg_id
-                elif tipo == "Salida":
+                else:  # Salida o Permiso
                     if pendiente_ingreso is not None:
-                        filas.append((nombre_est, fch, pendiente_ingreso, hora, "fuera", est_id, pendiente_id, reg_id))
+                        filas.append((nombre_est, fch, pendiente_ingreso, hora, "fuera", est_id, pendiente_id, reg_id, tipo))
                         pendiente_ingreso = None
                         pendiente_id = None
                     else:
-                        filas.append((nombre_est, fch, "—", hora, "fuera", est_id, None, reg_id))
+                        filas.append((nombre_est, fch, "—", hora, "fuera", est_id, None, reg_id, tipo))
             if pendiente_ingreso is not None:
-                filas.append((nombre_est, fch, pendiente_ingreso, "—", "dentro", est_id, pendiente_id, None))
+                filas.append((nombre_est, fch, pendiente_ingreso, "—", "dentro", est_id, pendiente_id, None, None))
 
         filas.sort(key=lambda x: (x[1], x[2]), reverse=True)
 
-        for idx, (nombre_est, fch, h_entrada, h_salida, tag, est_id, entrada_id, salida_id) in enumerate(filas):
+        for idx, (nombre_est, fch, h_entrada, h_salida, tag, est_id, entrada_id, salida_id, tipo_salida) in enumerate(filas):
             estado_txt = "✅ Adentro" if tag == "dentro" else "🚪 Salió"
             punt_entrada = evaluar_puntualidad_entrada(h_entrada) if h_entrada != "—" else "—"
-            punt_salida  = evaluar_puntualidad_salida(h_salida) if h_salida != "—" else "—"
+            if h_salida != "—":
+                if tipo_salida == "Permiso":
+                    punt_salida = "🟢 Con permiso"
+                else:
+                    punt_salida = evaluar_puntualidad_salida(h_salida)
+            else:
+                punt_salida = "—"
             iid = str(idx)
             self.tree.insert("", "end", iid=iid,
                              values=("☐", nombre_est, fch, h_entrada, punt_entrada,
@@ -1736,16 +2112,34 @@ class ConsultaHistorial(tk.Frame):
         except Exception as e:
             messagebox.showerror("Error al exportar", f"No se pudo guardar el archivo:\n{e}")
 
-    def _imprimir_registro_estudiante(self):
-        # Fuente única de verdad: la selección real del Treeview (self.tree.selection()),
-        # la misma que usan "Eliminar seleccionados" y "Exportar CSV".
-        #
-        # - Si hay una o varias filas seleccionadas -> se imprime SOLO el historial
-        #   completo de esos estudiantes.
-        # - Si no hay ninguna selección -> se imprime el historial de todos los
-        #   estudiantes que aparecen en la tabla (comportamiento por defecto).
-        seleccion = self.tree.selection()
+    def _generar_reporte_individual(self, est_id, nombre_completo, grado, movimientos):
+        lineas = []
+        lineas.append("=" * 70)
+        lineas.append("REGISTRO DE ASISTENCIA ESTUDIANTIL (RAE)")
+        lineas.append("=" * 70)
+        lineas.append(f"Generado   : {datetime.now().strftime('%Y-%m-%d %I:%M %p')}")
+        lineas.append(f"Estudiante : {nombre_completo} (ID: {est_id})")
+        lineas.append(f"Código      : {grado}")
+        lineas.append("=" * 70)
+        lineas.append(f"{'Fecha':<14}{'Hora':<12}{'Tipo':<12}{'Puntualidad'}")
+        lineas.append("-" * 70)
+        for fecha, hora, tipo in movimientos:
+            if tipo == "Ingreso":
+                punt = evaluar_puntualidad_entrada(hora)
+            elif tipo == "Permiso":
+                punt = "🟢 Con permiso"
+            else:
+                punt = evaluar_puntualidad_salida(hora)
+            lineas.append(f"{fecha:<14}{hora:<12}{tipo:<12}{punt}")
+        lineas.append("-" * 70)
+        lineas.append(f"Total de movimientos: {len(movimientos)}")
+        lineas.append("\n" + "=" * 70)
+        lineas.append("FIN DEL REPORTE")
+        return "\n".join(lineas)
 
+    def _imprimir_registro_estudiante(self):
+        """Genera el reporte y lo envía directamente a la impresora."""
+        seleccion = self.tree.selection()
         ids_estudiantes = set()
         if seleccion:
             for iid in seleccion:
@@ -1761,91 +2155,166 @@ class ConsultaHistorial(tk.Frame):
             messagebox.showinfo("Sin datos", "No hay registros para generar el reporte.")
             return
 
-        lineas = []
-        lineas.append("=" * 70)
-        lineas.append("REGISTRO DE ASISTENCIA ESTUDIANTIL (RAE)")
-        lineas.append("=" * 70)
-        lineas.append(f"Generado   : {datetime.now().strftime('%Y-%m-%d %I:%M %p')}")
-        if seleccion:
-            lineas.append(f"Alcance    : {len(ids_estudiantes)} estudiante(s) seleccionado(s)")
-        else:
-            lineas.append("Alcance    : Todos los estudiantes de la tabla (sin selección)")
-        lineas.append("=" * 70)
-
         conn = get_connection()
         c = conn.cursor()
 
-        for est_id in ids_estudiantes:
-            c.execute("SELECT nombre, apellido, grado FROM estudiantes WHERE id=?", (est_id,))
-            datos_est = c.fetchone()
-            if not datos_est:
-                continue
+        if seleccion:
+            contenido_total = []
+            contenido_total.append("=" * 70)
+            contenido_total.append("REPORTES INDIVIDUALES (ESTUDIANTES SELECCIONADOS)")
+            contenido_total.append("=" * 70)
+            contenido_total.append(f"Generado   : {datetime.now().strftime('%Y-%m-%d %I:%M %p')}")
+            contenido_total.append(f"Estudiantes: {len(ids_estudiantes)} seleccionado(s)")
+            contenido_total.append("=" * 70)
 
-            c.execute("""
-                SELECT fecha, hora, tipo
-                FROM registros
-                WHERE estudiante_id = ?
-                ORDER BY fecha ASC, id ASC
-            """, (est_id,))
-            movimientos = c.fetchall()
+            hay_movimientos = False
+            for est_id in ids_estudiantes:
+                c.execute("SELECT nombre, apellido, grado FROM estudiantes WHERE id=?", (est_id,))
+                datos_est = c.fetchone()
+                if not datos_est:
+                    continue
 
-            if not movimientos:
-                continue
+                c.execute("""
+                    SELECT fecha, hora, tipo
+                    FROM registros
+                    WHERE estudiante_id = ?
+                    ORDER BY fecha ASC, id ASC
+                """, (est_id,))
+                movimientos = c.fetchall()
 
-            nombre_completo = f"{datos_est[0]} {datos_est[1]}"
-            grado = datos_est[2]
+                if not movimientos:
+                    continue
 
-            lineas.append(f"\nEstudiante : {nombre_completo} (ID: {est_id})")
-            lineas.append(f"Grado      : {grado}")
-            lineas.append("-" * 70)
-            lineas.append(f"{'Fecha':<14}{'Hora':<12}{'Tipo':<12}{'Puntualidad'}")
-            lineas.append("-" * 70)
+                hay_movimientos = True
+                nombre_completo = f"{datos_est[0]} {datos_est[1]}"
+                grado = datos_est[2]
+                reporte = self._generar_reporte_individual(est_id, nombre_completo, grado, movimientos)
+                contenido_total.append("\n" + reporte)
+                contenido_total.append("\n" + "-" * 70 + "\n")
 
-            for fecha, hora, tipo in movimientos:
-                punt = evaluar_puntualidad_entrada(hora) if tipo == "Ingreso" else evaluar_puntualidad_salida(hora)
-                lineas.append(f"{fecha:<14}{hora:<12}{tipo:<12}{punt}")
+            conn.close()
 
-            lineas.append("-" * 70)
-            lineas.append(f"Total de movimientos: {len(movimientos)}")
+            if not hay_movimientos:
+                messagebox.showinfo("Sin reportes", "Ninguno de los estudiantes seleccionados tiene movimientos.")
+                return
 
-        conn.close()
+            contenido = "\n".join(contenido_total)
+            try:
+                tmp_dir = tempfile.gettempdir()
+                nombre_archivo = f"RAE_seleccion_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+                ruta = os.path.join(tmp_dir, nombre_archivo)
+                with open(ruta, "w", encoding="utf-8") as f:
+                    f.write(contenido)
+            except Exception as e:
+                messagebox.showerror("Error", f"No se pudo generar el archivo:\n{e}")
+                return
 
-        lineas.append("\n" + "=" * 70)
-        lineas.append("FIN DEL REPORTE")
+            try:
+                # Enviar a la impresora predeterminada
+                os.startfile(ruta, "print")
+                mostrar_toast(
+                    self.winfo_toplevel(),
+                    "🖨️ Reporte enviado a la impresora",
+                    color=COLOR_GRAY,
+                    duracion=3000  # El mensaje se borra automáticamente después de 3 segundos
+                )
+            except AttributeError:
+                messagebox.showinfo(
+                    "Impresión",
+                    f"El reporte se guardó en:\n{ruta}\n\nÁbralo para imprimirlo manualmente."
+                )
+            except Exception as e:
+                messagebox.showerror(
+                    "Error al imprimir",
+                    f"No se pudo enviar a la impresora.\n"
+                    f"El archivo se guardó en:\n{ruta}\n\nDetalle: {e}"
+                )
 
-        contenido = "\n".join(lineas)
+        else:
+            lineas = []
+            lineas.append("=" * 70)
+            lineas.append("REGISTRO DE ASISTENCIA ESTUDIANTIL (RAE)")
+            lineas.append("=" * 70)
+            lineas.append(f"Generado   : {datetime.now().strftime('%Y-%m-%d %I:%M %p')}")
+            lineas.append("Alcance    : Todos los estudiantes de la tabla (sin selección)")
+            lineas.append("=" * 70)
 
-        try:
-            tmp_dir = tempfile.gettempdir()
-            nombre_archivo = f"RAE_registro_{datetime.now().strftime('%Y%m%d%H%M%S')}.txt"
-            ruta = os.path.join(tmp_dir, nombre_archivo)
-            with open(ruta, "w", encoding="utf-8") as f:
-                f.write(contenido)
-        except Exception as e:
-            messagebox.showerror("Error", f"No se pudo generar el archivo:\n{e}")
-            return
+            for est_id in ids_estudiantes:
+                c.execute("SELECT nombre, apellido, grado FROM estudiantes WHERE id=?", (est_id,))
+                datos_est = c.fetchone()
+                if not datos_est:
+                    continue
 
-        try:
-            os.startfile(ruta)
-            mostrar_toast(
-                self.winfo_toplevel(),
-                f"📄 Reporte generado y abierto ({len(ids_estudiantes)} estudiante(s))",
-                color=COLOR_BLUE,
-                duracion=3000
-            )
-        except AttributeError:
-            messagebox.showinfo(
-                "Reporte generado",
-                f"El reporte se guardó en:\n{ruta}\n\nÁbralo con su editor de texto."
-            )
-        except Exception as e:
-            messagebox.showerror(
-                "Error al abrir",
-                f"No se pudo abrir el archivo automáticamente.\n"
-                f"El archivo se guardó en:\n{ruta}\n\nDetalle: {e}"
-            )
+                c.execute("""
+                    SELECT fecha, hora, tipo
+                    FROM registros
+                    WHERE estudiante_id = ?
+                    ORDER BY fecha ASC, id ASC
+                """, (est_id,))
+                movimientos = c.fetchall()
 
-# ==================== GENERACIÓN DE REPORTES ====================
+                if not movimientos:
+                    continue
+
+                nombre_completo = f"{datos_est[0]} {datos_est[1]}"
+                grado = datos_est[2]
+
+                lineas.append(f"\nEstudiante : {nombre_completo} (ID: {est_id})")
+                lineas.append(f"Código      : {grado}")
+                lineas.append("-" * 70)
+                lineas.append(f"{'Fecha':<14}{'Hora':<12}{'Tipo':<12}{'Puntualidad'}")
+                lineas.append("-" * 70)
+
+                for fecha, hora, tipo in movimientos:
+                    if tipo == "Ingreso":
+                        punt = evaluar_puntualidad_entrada(hora)
+                    elif tipo == "Permiso":
+                        punt = "🟢 Con permiso"
+                    else:
+                        punt = evaluar_puntualidad_salida(hora)
+                    lineas.append(f"{fecha:<14}{hora:<12}{tipo:<12}{punt}")
+
+                lineas.append("-" * 70)
+                lineas.append(f"Total de movimientos: {len(movimientos)}")
+
+            conn.close()
+
+            lineas.append("\n" + "=" * 70)
+            lineas.append("FIN DEL REPORTE")
+            contenido = "\n".join(lineas)
+
+            try:
+                tmp_dir = tempfile.gettempdir()
+                nombre_archivo = f"RAE_registro_{datetime.now().strftime('%Y%m%d%H%M%S')}.txt"
+                ruta = os.path.join(tmp_dir, nombre_archivo)
+                with open(ruta, "w", encoding="utf-8") as f:
+                    f.write(contenido)
+            except Exception as e:
+                messagebox.showerror("Error", f"No se pudo generar el archivo:\n{e}")
+                return
+
+            try:
+                # Enviar a la impresora predeterminada
+                os.startfile(ruta, "print")
+                mostrar_toast(
+                    self.winfo_toplevel(),
+                    "🖨️ Reporte enviado a la impresora",
+                    color=COLOR_GRAY,
+                    duracion=3000  # El mensaje se borra automáticamente después de 3 segundos
+                )
+            except AttributeError:
+                messagebox.showinfo(
+                    "Impresión",
+                    f"El reporte se guardó en:\n{ruta}\n\nÁbralo para imprimirlo manualmente."
+                )
+            except Exception as e:
+                messagebox.showerror(
+                    "Error al imprimir",
+                    f"No se pudo enviar a la impresora.\n"
+                    f"El archivo se guardó en:\n{ruta}\n\nDetalle: {e}"
+                )
+
+# ==================== GENERACIÓN DE REPORTES (GENERAL) ====================
 class GeneracionReportes(tk.Frame):
     def __init__(self, master, root=None, close_callback=None):
         super().__init__(master, bg=BG_MAIN)
@@ -1874,7 +2343,7 @@ class GeneracionReportes(tk.Frame):
 
         tk.Label(filt, text="Tipo:", bg=BG_CARD, font=FONT_NORMAL).grid(row=2,column=0,sticky="w",pady=(12,0))
         self.combo_tipo = ttk.Combobox(filt, width=20,
-                                        values=["Todos","Solo Ingresos","Solo Salidas"],
+                                        values=["Todos","Solo Ingresos","Solo Salidas","Solo Permisos"],
                                         font=FONT_NORMAL)
         self.combo_tipo.current(0)
         self.combo_tipo.grid(row=2,column=1,padx=(8,0),pady=(12,0),sticky="w")
@@ -1899,6 +2368,7 @@ class GeneracionReportes(tk.Frame):
 
         self.tree.tag_configure("ingreso", foreground=COLOR_GREEN)
         self.tree.tag_configure("salida",  foreground=COLOR_BLUE)
+        self.tree.tag_configure("permiso", foreground=COLOR_ORANGE)
 
     def _generar(self):
         for row in self.tree.get_children():
@@ -1932,16 +2402,76 @@ class GeneracionReportes(tk.Frame):
             q += " AND r.tipo='Ingreso'"
         elif tipo_filtro == "Solo Salidas":
             q += " AND r.tipo='Salida'"
+        elif tipo_filtro == "Solo Permisos":
+            q += " AND r.tipo='Permiso'"
         q += " ORDER BY r.id DESC"
         c.execute(q, params)
         rows = c.fetchall()
         conn.close()
         for reg_id, fecha, est, tipo, hora in rows:
-            tag = "ingreso" if tipo == "Ingreso" else "salida"
-            punt = evaluar_puntualidad_entrada(hora) if tipo == "Ingreso" else evaluar_puntualidad_salida(hora)
+            if tipo == "Ingreso":
+                tag = "ingreso"
+                punt = evaluar_puntualidad_entrada(hora)
+            elif tipo == "Permiso":
+                tag = "permiso"
+                punt = "🟢 Con permiso"
+            else:
+                tag = "salida"
+                punt = evaluar_puntualidad_salida(hora)
             self.tree.insert("","end", values=(reg_id, fecha, est, tipo, hora, punt), tags=(tag,))
         if not rows:
             messagebox.showinfo("Sin resultados","No se encontraron registros con esos filtros.")
+
+# ==================== FUNCIÓN PRINCIPAL DE REGISTRO ====================
+def realizar_registro_db(est_id, nombre, apellido, master=None, tipo_override=None):
+    now   = datetime.now()
+    fecha = now.strftime("%Y-%m-%d")
+    hora  = now.strftime("%I:%M %p")
+    conn = get_connection()
+    c    = conn.cursor()
+
+    if tipo_override:
+        tipo = tipo_override
+    else:
+        c.execute(
+            "SELECT tipo FROM registros WHERE estudiante_id=? AND fecha=? ORDER BY id DESC LIMIT 1",
+            (est_id, fecha)
+        )
+        ultimo = c.fetchone()
+        tipo = "Salida" if ultimo and ultimo[0] in ("Ingreso", "Permiso") else "Ingreso"
+
+    if tipo == "Ingreso":
+        puntualidad = evaluar_puntualidad_entrada(hora)
+    elif tipo == "Permiso":
+        puntualidad = "🟢 Con permiso"
+    else:
+        puntualidad = evaluar_puntualidad_salida(hora)
+
+    observacion = f"Registrado automáticamente — {puntualidad}"
+    c.execute(
+        "INSERT INTO registros (estudiante_id, tipo, fecha, hora, observaciones) VALUES (?,?,?,?,?)",
+        (est_id, tipo, fecha, hora, observacion)
+    )
+    conn.commit()
+
+    c.execute("SELECT email_encargado FROM estudiantes WHERE id=?", (est_id,))
+    row_email = c.fetchone()
+    email_encargado = row_email[0] if row_email else None
+
+    if email_encargado:
+        nombre_completo = f"{nombre} {apellido}"
+        if tipo == "Ingreso" and "Tarde" in puntualidad:
+            enviar_correo_entrada_tardia(nombre_completo, fecha, hora, email_encargado)
+        elif tipo == "Salida" and "Salida anticipada" in puntualidad:
+            enviar_correo_salida_anticipada(nombre_completo, fecha, hora, email_encargado)
+
+    conn.close()
+    if master:
+        color   = COLOR_GREEN if tipo == "Ingreso" else (COLOR_ORANGE if tipo == "Permiso" else COLOR_BLUE)
+        emoji   = "✅" if tipo == "Ingreso" else ("📝" if tipo == "Permiso" else "🚪")
+        mensaje = f"{emoji}  {nombre} {apellido}  —  {tipo} registrado  ({puntualidad})"
+        mostrar_toast(master, mensaje, color=color, duracion=3000)
+    return tipo, nombre, apellido, puntualidad
 
 # ==================== MAIN ====================
 def main():
